@@ -86,6 +86,12 @@ def main():
         lines.pop()
     fd = open_port(args.port or find_port(), args.baud, not args.no_flow)
     try:
+        # One job at a time, or two senders would interleave on the paper
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Waiting for another print job to finish.", file=sys.stderr)
+            fcntl.flock(fd, fcntl.LOCK_EX)
         for line in lines:
             line = line.rstrip(b" \t")
             if not args.no_flow:

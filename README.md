@@ -83,6 +83,41 @@ Sending a 4-page job at full speed with RTS/CTS flow control on garbled it about
 
 The likely cause is data already in flight in the USB adapter when the printer signals busy, but that was never measured directly. Treat it as a working theory.
 
+## Print server
+
+`printserver/` turns the Pi into a CUPS print server with two printers for the one ImageWriter:
+
+| Printer | What it does |
+|---|---|
+| `ImageWriter-Text` | Prints what it's given. Plain text goes through unchanged, apart from wrapping at 80 columns and replacing anything the printer can't print. PDFs and PostScript have their text extracted. Images are rejected. |
+| `ImageWriter-AI` | Sends the job to Claude, which rewrites it as a readable ASCII printout. Handles PDFs, images, web pages and text. |
+
+**Anything sent to `ImageWriter-AI` is uploaded to the Anthropic API and billed to your API key.** Don't send it documents you wouldn't want to leave your network.
+
+Install from a copy of this repo on the Pi. This installs CUPS and shares both printers on your local network, with remote administration off:
+
+```bash
+sudo sh printserver/install-printserver.sh
+```
+
+Then add your API key to `/etc/imagewriter/imagewriter.env`, which is readable only by root and the `lp` group:
+
+```bash
+sudo nano /etc/imagewriter/imagewriter.env
+```
+
+Print from the Pi or preview without using paper:
+
+```bash
+lp -d ImageWriter-Text notes.txt
+lp -d ImageWriter-AI article.pdf
+/usr/lib/cups/backend/imagewriter --render ai article.pdf
+```
+
+Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageWriter-Text` and `http://PI-ADDRESS:631/printers/ImageWriter-AI`. These are raw queues, so the client must send PDF, PostScript, an image or plain text. Other formats are rejected rather than printed as junk.
+
+**Limits:** each job stops at `IMAGEWRITER_MAX_PAGES` (default 4), and `ImageWriter-AI` rejects PDFs over `IMAGEWRITER_MAX_INPUT_PAGES` (default 50). A failed job is dropped without retrying, and the reason appears in the CUPS job log. Change these in the same settings file.
+
 ## Extras
 
 `extras/photo2ascii.py` converts a photo to cartoon-style ASCII art. It needs Pillow and NumPy, and it's hit and miss: faces need a tight crop and usually a hand-traced outline to remove the background.
@@ -103,3 +138,9 @@ python3 tests/test_tools.py
 ```
 
 They don't cover the busy-signal path, which needs real hardware. Step 2 above checks that.
+
+On a print server, this also tests the backend using a local stand-in for the Claude API, so it needs no key and spends nothing:
+
+```bash
+/opt/imagewriter/venv/bin/python tests/test_backend.py
+```
