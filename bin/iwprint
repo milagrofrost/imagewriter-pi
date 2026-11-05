@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Print text files (or stdin) on an Apple ImageWriter over USB serial.
+
+The printer's busy signal alone was not enough in testing: sending at full
+speed with RTS/CTS on garbled a long job once the printer's buffer filled.
+So each line is sent on its own, drained, given roughly the time the printer
+needs to print it, and only sent once the printer reports ready.
+"""
+import argparse, fcntl, glob, os, struct, sys, termios, time
+
+DEFAULT_CPS = 100             # under the printer's ~120 characters/second, for margin
+DEFAULT_LINE_OVERHEAD = 0.35  # carriage return + line feed time, seconds
+BUSY_NOTICE_AFTER = 5         # seconds before explaining a long wait
+
+
+def find_port():
+    port = os.environ.get("IWPRINT_PORT")
+    if port:
+        return port
+    ports = sorted(glob.glob("/dev/serial/by-id/*"))
+    if len(ports) > 1:
+        sys.exit("Several serial adapters found; choose one with --port or IWPRINT_PORT:\n  " + "\n  ".join(ports))
+    if ports:
+        return ports[0]
+    if os.path.exists("/dev/ttyUSB0"):
+        return "/dev/ttyUSB0"
+    sys.exit("No USB serial adapter found. Check the adapter, or use --port.")
+
+
+def open_port(path, baud, flow):
+    # O_NONBLOCK so the open cannot hang waiting on carrier before CLOCAL is set
+    fd = os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    a = termios.tcgetattr(fd)
+    a[0] = 0                                                    # iflag: no XON/XOFF, raw
+    a[1] = 0                                                    # oflag: no output processing
+    a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+    if flow:
+        a[2] |= termios.CRTSCTS
+    a[3] = 0                                                    # lflag: raw
+    a[4] = a[5] = getattr(termios, "B%d" % baud)
+    termios.tcsetattr(fd, termios.TCSANOW, a)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+    return fd
+
+
+def printer_ready(fd):
+    v = struct.unpack("I", fcntl.ioctl(fd, termios.TIOCMGET, struct.pack("I", 0)))[0]
+    return bool(v & termios.TIOCM_CTS)
+
+
+def wait_until_ready(fd):
+    waited = 0.0
+    while not printer_ready(fd):
+        time.sleep(0.1)
+        waited += 0.1
+        if BUSY_NOTICE_AFTER <= waited < BUSY_NOTICE_AFTER + 0.1:
+            print("Waiting for the printer (CTS is low). Is it on with the Select light lit?\n"
+                  "If it never starts, your cable may not carry the busy signal: see --no-flow.",
+                  file=sys.stderr)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Print text on an ImageWriter without overrunning it.")
+    p.add_argument("files", nargs="*", help="files to print (default: stdin)")
+    p.add_argument("--port", help="serial device (default: $IWPRINT_PORT, else auto-detect)")
+    p.add_argument("--baud", type=int, default=9600, help="must match the printer's DIP switches (default: 9600)")
+    p.add_argument("--cps", type=float, default=DEFAULT_CPS, help="pacing, characters per second (default: %(default)s)")
+    p.add_argument("--line-overhead", type=float, default=DEFAULT_LINE_OVERHEAD, help="extra seconds per line (default: %(default)s)")
+    p.add_argument("--no-flow", action="store_true", help="ignore the busy signal, for cables that do not carry it; pacing only")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    if not hasattr(termios, "B%d" % args.baud):
+        sys.exit("Unsupported baud rate: %d" % args.baud)
+    if args.files:
+        data = b""
+        for path in args.files:
+            with open(path, "rb") as f:
+                data += f.read()
+    else:
+        data = sys.stdin.buffer.read()
+    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    fd = open_port(args.port or find_port(), args.baud, not args.no_flow)
+    try:
+        for line in lines:
+            line = line.rstrip(b" \t")
+            if not args.no_flow:
+                wait_until_ready(fd)
+            os.write(fd, line + b"\r\n")
+            termios.tcdrain(fd)
+            time.sleep(len(line) / args.cps + args.line_overhead)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

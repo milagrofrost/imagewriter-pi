@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Show the serial adapter's handshake inputs, to see how a cable is wired.
+
+Run with --watch, press Select on the printer, and see which lines change.
+The line that follows the Select light carries the printer's busy signal.
+"""
+import argparse, fcntl, glob, os, struct, sys, termios, time
+
+LINES = ("CTS", "DSR", "CD", "RI")
+
+
+def find_port():
+    port = os.environ.get("IWPRINT_PORT")
+    if port:
+        return port
+    ports = sorted(glob.glob("/dev/serial/by-id/*"))
+    if len(ports) > 1:
+        sys.exit("Several serial adapters found; choose one with --port or IWPRINT_PORT:\n  " + "\n  ".join(ports))
+    if ports:
+        return ports[0]
+    if os.path.exists("/dev/ttyUSB0"):
+        return "/dev/ttyUSB0"
+    sys.exit("No USB serial adapter found. Check the adapter, or use --port.")
+
+
+def read(fd):
+    v = struct.unpack("I", fcntl.ioctl(fd, termios.TIOCMGET, struct.pack("I", 0)))[0]
+    return {n: int(bool(v & getattr(termios, "TIOCM_" + n))) for n in LINES}
+
+
+def main():
+    p = argparse.ArgumentParser(description="Show the serial adapter's handshake input lines.")
+    p.add_argument("--port", help="serial device (default: $IWPRINT_PORT, else auto-detect)")
+    p.add_argument("--watch", action="store_true", help="keep reading and print each change; Ctrl-C to stop")
+    args = p.parse_args()
+    fd = os.open(args.port or find_port(), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    last = read(fd)
+    print(last, flush=True)
+    try:
+        while args.watch:
+            time.sleep(0.2)
+            now = read(fd)
+            if now != last:
+                print(now, flush=True)
+                last = now
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

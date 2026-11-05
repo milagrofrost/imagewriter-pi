@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# personal photos and generated art stay out of the repo
+*.jpg
+*.jpeg
+*.png
+*.webp
