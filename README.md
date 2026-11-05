@@ -1,6 +1,6 @@
 # imagewriter-pi
 
-Print plain text and ASCII art on an Apple ImageWriter I from a Raspberry Pi, over a USB-to-serial adapter. There is no driver or CUPS: the printer prints the ASCII it receives, so a small Python script is all it takes.
+Print plain text, ASCII art and dot graphics on an Apple ImageWriter I from a Raspberry Pi, over a USB-to-serial adapter. The core tools need no driver or CUPS, just a small Python script.
 
 ```
 Raspberry Pi -> USB-serial adapter -> serial cable -> ImageWriter
@@ -65,6 +65,7 @@ iwprint examples/ai_slop.txt
 iwprint notes.txt                        # print a file
 iwsign "HAPPY" "HALLOWEEN!" | iwprint    # print a big sign
 iwsign "HAPPY" > sign.txt                # save a sign without printing it
+iwprint --graphics cat.pbm               # print a binary PBM image as dots
 ```
 
 The printer fits 80 columns and 66 lines per page. Keep text plain ASCII.
@@ -76,6 +77,9 @@ The printer fits 80 columns and 66 lines per page. Keep text plain ASCII.
 | `--cps N` | Pacing in characters per second. Default 100. Lower it if long jobs garble. |
 | `--line-overhead S` | Extra seconds per line. Default 0.35. |
 | `--no-flow` | Ignore the busy signal and rely on pacing alone. |
+| `--graphics` | Input is binary PBM (P4) images, up to 576 dots wide at 72 dots per inch. |
+| `--reset` | Return the printer to normal text settings first. |
+| `--busy-timeout S` | Give up with exit status 5 if the printer stays busy for S seconds. |
 
 ## Why it paces every line
 
@@ -85,12 +89,13 @@ The likely cause is data already in flight in the USB adapter when the printer s
 
 ## Print server
 
-`printserver/` turns the Pi into a CUPS print server with two printers for the one ImageWriter:
+`printserver/` turns the Pi into a CUPS print server with three printers for the one ImageWriter:
 
 | Printer | What it does |
 |---|---|
 | `ImageWriter-Text` | Prints what it's given. Plain text goes through unchanged, apart from wrapping at 80 columns and replacing anything the printer can't print. PDFs and PostScript have their text extracted. Images are rejected. |
 | `ImageWriter-AI` | Sends the job to Claude, which rewrites it as a readable ASCII printout. Handles PDFs, images, web pages and text. |
+| `ImageWriter-Graphics` | Prints images and PDFs as real dots, scaled to 8 inches wide. Line art stays pure black and white, and anything with shading is dithered. Runs on the Pi, with no API use. |
 
 **Anything sent to `ImageWriter-AI` is uploaded to the Anthropic API and billed to your API key.** Don't send it documents you wouldn't want to leave your network.
 
@@ -112,19 +117,22 @@ Print from the Pi or preview without using paper:
 lp -d ImageWriter-Text notes.txt
 lp -d ImageWriter-AI article.pdf
 /usr/lib/cups/backend/imagewriter --render ai article.pdf
+/usr/lib/cups/backend/imagewriter --render graphics photo.jpg > preview.pbm
 ```
 
-Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageWriter-Text` and `http://PI-ADDRESS:631/printers/ImageWriter-AI`. The client must send PDF, PostScript, an image or plain text. Other formats are rejected rather than printed as junk.
+Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageWriter-Text`, `http://PI-ADDRESS:631/printers/ImageWriter-AI` and `http://PI-ADDRESS:631/printers/ImageWriter-Graphics`. The client must send PDF, PostScript, an image or plain text. Other formats are rejected rather than printed as junk.
 
 ### Phones
 
-Both printers are announced on the local network with Avahi, so iPhones and Android phones on the same network can look for them in their normal print menu. Discovery usually doesn't cross VLANs or guest Wi-Fi. On Android, you may need to turn on the Default Print Service under your printing settings.
+All three printers are announced on the local network with Avahi, so iPhones and Android phones on the same network can look for them in their normal print menu. Discovery usually doesn't cross VLANs or guest Wi-Fi. On Android, you may need to turn on the Default Print Service under your printing settings.
 
-Raster jobs (URF or PWG) from a phone are converted to PDF before they reach the backend. They contain only images, so `ImageWriter-Text` refuses them and suggests `ImageWriter-AI`. The same goes for photos.
+Raster jobs (URF or PWG) from a phone are converted to PDF before they reach the backend. They contain only images, so `ImageWriter-Text` refuses them and suggests `ImageWriter-AI`. The same goes for photos. `ImageWriter-Graphics` prints them directly.
 
 **Once announced, `ImageWriter-AI` appears in the print menu of everyone on your network, and their jobs are billed to your API key.** To stop announcing a printer while still using it from this Pi, run `sudo lpadmin -p ImageWriter-AI -o printer-is-shared=false`.
 
-**Limits:** each job stops at `IMAGEWRITER_MAX_PAGES` (default 4), and `ImageWriter-AI` rejects PDFs over `IMAGEWRITER_MAX_INPUT_PAGES` (default 50). A failed job is dropped without retrying, and the reason appears in the CUPS job log. Change these in the same settings file.
+**Limits:** each job stops at `IMAGEWRITER_MAX_PAGES` (default 4), and `ImageWriter-AI` rejects PDFs over `IMAGEWRITER_MAX_INPUT_PAGES` (default 50). `ImageWriter-Graphics` drops a job if the printer stays busy for `IMAGEWRITER_BUSY_TIMEOUT` seconds (default 600). A failed job is dropped without retrying, and the reason appears in the CUPS job log. Change these in the same settings file.
+
+Dark photos use a lot of ribbon, and a cancelled or dropped graphics job may leave part of a picture on the paper.
 
 ## Extras
 

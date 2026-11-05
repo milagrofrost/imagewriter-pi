@@ -1,7 +1,8 @@
 #!/bin/sh
-# Turn this Pi into a print server with two queues for one ImageWriter:
+# Turn this Pi into a print server with three queues for one ImageWriter:
 #   ImageWriter-Text  prints what it is given
 #   ImageWriter-AI    has Claude rewrite the job as an ASCII printout
+#   ImageWriter-Graphics  prints images and PDFs as real dots
 # Run with sudo from a copy of this repository. Safe to run again.
 set -eu
 
@@ -46,6 +47,7 @@ add_queue() {
 }
 add_queue ImageWriter-Text imagewriter:/text "ImageWriter - prints text as-is"
 add_queue ImageWriter-AI imagewriter:/ai "ImageWriter - Claude translates the job to ASCII"
+add_queue ImageWriter-Graphics imagewriter:/graphics "ImageWriter - prints images as dots"
 lpstat -p
 
 grep -q '^ANTHROPIC_API_KEY=.' /etc/imagewriter/imagewriter.env ||

@@ -1,11 +1,13 @@
 #!/opt/imagewriter/venv/bin/python
-"""CUPS backend behind the two ImageWriter queues.
+"""CUPS backend behind the three ImageWriter queues.
 
 imagewriter:/text prints what it is given. imagewriter:/ai asks Claude to
 rewrite the job (PDF, image, web page or text) as a readable ASCII printout.
 Both end by handing plain text to iwprint, which paces it to the printer.
+imagewriter:/graphics turns images and PDFs into dots and hands iwprint bitmaps.
 
 Preview without paper:  imagewriter --render text|ai FILE
+                        imagewriter --render graphics FILE > preview.pbm
 """
 import base64, io, math, os, re, subprocess, sys, tempfile, textwrap, unicodedata
 
@@ -13,6 +15,9 @@ ENV_FILE = "/etc/imagewriter/imagewriter.env"
 IWPRINT = "/opt/imagewriter/iwprint"
 COLUMNS = 80
 LINES_PER_PAGE = 66
+DOT_COLUMNS = 576          # 8 inches at 72 dpi
+DOT_ROWS = 792             # 11 inches at 72 dpi
+LINE_ART_MAX_MIDTONES = 0.15  # share of grey pixels above which a job is dithered as a photo
 MAX_JOB_BYTES = 30 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 BACKEND_CANCEL_JOB = 5     # CUPS_BACKEND_CANCEL: drop this job, keep the queue running
@@ -257,9 +262,84 @@ def render_ai(data, kind, title):
     return tidy_reply(text)
 
 
-def render(mode, data, title):
+def max_pages():
+    return max_lines() // LINES_PER_PAGE
+
+
+def job_pictures(data, kind):
+    """The job's pictures as Pillow images: one for an image, one per page for a PDF."""
+    from PIL import Image
+
+    if kind == "image":
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+        except (OSError, ValueError, Image.DecompressionBombError) as e:
+            raise JobError("Could not read this image: %s" % e)
+        return [im]
+    if kind not in ("pdf", "postscript"):
+        raise JobError("ImageWriter-Graphics prints images and PDFs. Send text to ImageWriter-Text instead.")
+    pdf = to_pdf(data, kind)
+    pages = pdf_page_count(pdf)
+    if pages > max_pages():
+        print("INFO: Printing only the first %d of %d pages" % (max_pages(), pages), file=sys.stderr)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "job.pdf")
+        with open(path, "wb") as f:
+            f.write(pdf)
+        run(["pdftoppm", "-r", "144", "-gray", "-l", str(max_pages()), path, os.path.join(tmp, "page")], b"")
+        pictures = []
+        for name in sorted(n for n in os.listdir(tmp) if n.endswith(".pgm")):
+            with Image.open(os.path.join(tmp, name)) as im:
+                pictures.append(im.copy())
+    return pictures
+
+
+def to_dots(im):
+    """Scale to the paper, then threshold line art or dither anything with shading."""
+    from PIL import Image, ImageOps
+
+    im = ImageOps.exif_transpose(im).convert("RGBA")
+    paper = Image.new("RGBA", im.size, "white")
+    paper.alpha_composite(im)
+    im = paper.convert("L")
+    scale = min(DOT_COLUMNS / im.width, DOT_ROWS / im.height)
+    im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
+    shades = im.histogram()
+    if sum(shades[64:192]) / (im.width * im.height) <= LINE_ART_MAX_MIDTONES:
+        return im.point(lambda v: 255 if v > 200 else 0).convert("1", dither=Image.Dither.NONE)
+    # Printed dots spread into each other, so lighten the middle tones to keep detail
+    im = ImageOps.autocontrast(im, cutoff=1).point(lambda v: round(255 * (v / 255) ** 0.75))
+    return im.convert("1")
+
+
+def render_graphics(data, kind):
+    """Return (binary PBM images, page count); only the last page stops early."""
+    from PIL import Image, ImageChops
+
+    pages = [to_dots(im) for im in job_pictures(data, kind)[:max_pages()]]
+    boxes = [ImageChops.invert(p.convert("L")).getbbox() for p in pages]
+    if not any(boxes):
+        raise JobError("This job has nothing to print on it.")
+    while not boxes[-1]:
+        pages.pop()
+        boxes.pop()
+    out = io.BytesIO()
+    for i, page in enumerate(pages):
+        height = DOT_ROWS if i < len(pages) - 1 else (boxes[i][3] + 7) // 8 * 8
+        sheet = Image.new("1", (page.width, height), 1)
+        sheet.paste(page, (0, 0))
+        sheet.save(out, "PPM")
+    return out.getvalue(), len(pages)
+
+
+def check_size(data):
     if len(data) > MAX_JOB_BYTES:
         raise JobError("This job is too large (%d MB)." % (len(data) // (1024 * 1024)))
+
+
+def render(mode, data, title):
+    check_size(data)
     kind = detect(data)
     return fit_to_paper(render_ai(data, kind, title) if mode == "ai" else render_text(data, kind))
 
@@ -274,38 +354,49 @@ def backend_main():
     else:
         data = sys.stdin.buffer.read()
     mode = os.environ.get("DEVICE_URI", "").rsplit("/", 1)[-1]
-    if mode not in ("text", "ai"):
+    if mode not in ("text", "ai", "graphics"):
         raise JobError("Unknown device URI: %s" % os.environ.get("DEVICE_URI"))
-    text = render(mode, data, title)
-    total_pages = math.ceil(text.count("\n") / LINES_PER_PAGE) * copies
-    allowed = max_lines() // LINES_PER_PAGE
-    if total_pages > allowed:
-        copies = max(1, copies * allowed // total_pages)
+    if mode == "graphics":
+        check_size(data)
+        job, pages = render_graphics(data, detect(data))
+        command = [IWPRINT, "--graphics", "--busy-timeout", os.environ.get("IMAGEWRITER_BUSY_TIMEOUT", "600")]
+    else:
+        text = render(mode, data, title)
+        job, pages = text.encode("ascii"), math.ceil(text.count("\n") / LINES_PER_PAGE)
+        command = [IWPRINT, "--reset"]  # an interrupted graphics job can leave graphics settings behind
+    if pages * copies > max_pages():
+        copies = max(1, max_pages() // pages)
         print("INFO: Reduced to %d copies to stay within the page limit" % copies, file=sys.stderr)
     out = tempfile.TemporaryFile()
-    out.write(text.encode("ascii") * copies)
+    out.write(job * copies)
     out.seek(0)
     os.dup2(out.fileno(), 0)
     print("STATE: +printing-to-imagewriter", file=sys.stderr)
     sys.stderr.flush()
     # exec, so cancelling the job signals iwprint directly and printing stops
-    os.execv(IWPRINT, [IWPRINT])
+    os.execv(IWPRINT, command)
 
 
 def main():
     if len(sys.argv) == 1:
         print('direct imagewriter:/text "Apple ImageWriter" "ImageWriter (text as-is)"')
         print('direct imagewriter:/ai "Apple ImageWriter" "ImageWriter (Claude translation)"')
+        print('direct imagewriter:/graphics "Apple ImageWriter" "ImageWriter (dot graphics)"')
         return
     load_env()
     try:
         if sys.argv[1] == "--render" and len(sys.argv) == 4:
             with open(sys.argv[3], "rb") as f:
-                sys.stdout.write(render(sys.argv[2], f.read(), os.path.basename(sys.argv[3])))
+                data = f.read()
+            if sys.argv[2] == "graphics":
+                check_size(data)
+                sys.stdout.buffer.write(render_graphics(data, detect(data))[0])
+            else:
+                sys.stdout.write(render(sys.argv[2], data, os.path.basename(sys.argv[3])))
         elif len(sys.argv) in (6, 7):
             backend_main()
         else:
-            sys.exit("usage: imagewriter job-id user title copies options [file]\n       imagewriter --render text|ai FILE")
+            sys.exit("usage: imagewriter job-id user title copies options [file]\n       imagewriter --render text|ai|graphics FILE")
     except JobError as e:
         print("ERROR: %s" % e, file=sys.stderr)
         sys.exit(BACKEND_CANCEL_JOB)
