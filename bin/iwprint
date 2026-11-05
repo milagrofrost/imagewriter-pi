@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
-"""Print text files (or stdin) on an Apple ImageWriter over USB serial.
+"""Print text files or bitmaps (or stdin) on an Apple ImageWriter over USB serial.
 
 The printer's busy signal alone was not enough in testing: sending at full
 speed with RTS/CTS on garbled a long job once the printer's buffer filled.
 So each line is sent on its own, drained, given roughly the time the printer
 needs to print it, and only sent once the printer reports ready.
+
+--graphics prints binary PBM (P4) images as dots, one 8-dot row at a time.
 """
-import argparse, fcntl, glob, os, struct, sys, termios, time
+import argparse, fcntl, glob, os, signal, struct, sys, termios, time
 
 DEFAULT_CPS = 100             # under the printer's ~120 characters/second, for margin
 DEFAULT_LINE_OVERHEAD = 0.35  # carriage return + line feed time, seconds
 BUSY_NOTICE_AFTER = 5         # seconds before explaining a long wait
+CUPS_CANCEL_JOB = 5           # exit status that drops a job and keeps the queue running
+
+ESC = b"\x1b"
+TEXT_MODE = ESC + b"N" + ESC + b"A" + ESC + b"<"     # 10 cpi, 6 lines per inch, both directions
+GRAPHICS_MODE = ESC + b"n" + ESC + b"T16" + ESC + b">"  # 72 dpi, 8-dot rows, one direction
+MAX_COLUMNS = 576             # 8 inches at 72 dpi
+DOTS_PER_SECOND = 400         # with the overhead below, printed a test image cleanly
+ROW_OVERHEAD = 0.6
+BLANK_ROW_SECONDS = 0.25
 
 
 def find_port():
@@ -48,15 +59,93 @@ def printer_ready(fd):
     return bool(v & termios.TIOCM_CTS)
 
 
-def wait_until_ready(fd):
+def wait_until_ready(fd, timeout=None):
     waited = 0.0
     while not printer_ready(fd):
+        if timeout and waited >= timeout:
+            print("ERROR: The printer was not ready for %d seconds, so this job was cancelled. "
+                  "Check its paper and Select light, then print again." % timeout, file=sys.stderr)
+            sys.exit(CUPS_CANCEL_JOB)
         time.sleep(0.1)
         waited += 0.1
         if BUSY_NOTICE_AFTER <= waited < BUSY_NOTICE_AFTER + 0.1:
             print("Waiting for the printer (CTS is low). Is it on with the Select light lit?\n"
                   "If it never starts, your cable may not carry the busy signal: see --no-flow.",
                   file=sys.stderr)
+
+
+def read_pbm(data):
+    """Return (width, height, bitmap) for each binary PBM image in data."""
+    images, pos = [], 0
+    while True:
+        while pos < len(data) and data[pos:pos + 1].isspace():
+            pos += 1
+        if pos == len(data):
+            return images
+        if data[pos:pos + 2] != b"P4":
+            sys.exit("--graphics needs binary PBM (P4) input.")
+        pos += 2
+        size = []
+        while len(size) < 2:
+            while data[pos:pos + 1].isspace():
+                pos += 1
+            if data[pos:pos + 1] == b"#":
+                pos = data.index(b"\n", pos)
+                continue
+            end = pos
+            while data[end:end + 1].isdigit():
+                end += 1
+            if end == pos:
+                sys.exit("Damaged PBM header.")
+            size.append(int(data[pos:end]))
+            pos = end
+        pos += 1  # the one whitespace byte before the bitmap
+        width, height = size
+        if not 0 < width <= MAX_COLUMNS:
+            sys.exit("This image is %d dots wide; the printer fits %d." % (width, MAX_COLUMNS))
+        length = (width + 7) // 8 * height
+        if pos + length > len(data):
+            sys.exit("This PBM image is cut short.")
+        images.append((width, height, data[pos:pos + length]))
+        pos += length
+
+
+def graphics_rows(width, height, bitmap):
+    """Yield each 8-dot row as column bytes, bit 0 on top, without trailing blanks."""
+    stride = (width + 7) // 8
+    for top in range(0, height, 8):
+        columns = bytearray(width)
+        for bit, y in enumerate(range(top, min(top + 8, height))):
+            line = bitmap[y * stride:(y + 1) * stride]
+            for x in range(width):
+                if line[x >> 3] & (0x80 >> (x & 7)):
+                    columns[x] |= 1 << bit
+        yield bytes(columns).rstrip(b"\0")
+
+
+def send(fd, data, seconds, args):
+    if not args.no_flow:
+        wait_until_ready(fd, args.busy_timeout)
+    os.write(fd, data)
+    termios.tcdrain(fd)
+    time.sleep(seconds)
+
+
+def print_graphics(fd, images, args):
+    # On cancel, finish the row in hand: a partial row would swallow later commands
+    cancelled = []
+    signal.signal(signal.SIGTERM, lambda *_: cancelled.append(True))
+    send(fd, GRAPHICS_MODE, 0.2, args)
+    for width, height, bitmap in images:
+        for columns in graphics_rows(width, height, bitmap):
+            if cancelled:
+                break
+            if columns:
+                send(fd, ESC + b"G%04d" % len(columns) + columns + b"\r\n", len(columns) / DOTS_PER_SECOND + ROW_OVERHEAD, args)
+            else:
+                send(fd, b"\r\n", BLANK_ROW_SECONDS, args)
+    if not cancelled or args.no_flow or printer_ready(fd):
+        send(fd, TEXT_MODE + b"\r\n", 0.2, args)
 
 
 def parse_args():
@@ -67,6 +156,9 @@ def parse_args():
     p.add_argument("--cps", type=float, default=DEFAULT_CPS, help="pacing, characters per second (default: %(default)s)")
     p.add_argument("--line-overhead", type=float, default=DEFAULT_LINE_OVERHEAD, help="extra seconds per line (default: %(default)s)")
     p.add_argument("--no-flow", action="store_true", help="ignore the busy signal, for cables that do not carry it; pacing only")
+    p.add_argument("--graphics", action="store_true", help="input is binary PBM images up to %d dots wide; print them as dots" % MAX_COLUMNS)
+    p.add_argument("--reset", action="store_true", help="first return the printer to normal text settings")
+    p.add_argument("--busy-timeout", type=float, metavar="S", help="give up if the printer stays busy this long (exit status %d)" % CUPS_CANCEL_JOB)
     return p.parse_args()
 
 
@@ -81,6 +173,7 @@ def main():
                 data += f.read()
     else:
         data = sys.stdin.buffer.read()
+    images = read_pbm(data) if args.graphics else None
     lines = data.replace(b"\r\n", b"\n").split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
@@ -92,10 +185,15 @@ def main():
         except BlockingIOError:
             print("Waiting for another print job to finish.", file=sys.stderr)
             fcntl.flock(fd, fcntl.LOCK_EX)
+        if args.reset:
+            send(fd, TEXT_MODE, 0.1, args)
+        if args.graphics:
+            print_graphics(fd, images, args)
+            return
         for line in lines:
             line = line.rstrip(b" \t")
             if not args.no_flow:
-                wait_until_ready(fd)
+                wait_until_ready(fd, args.busy_timeout)
             os.write(fd, line + b"\r\n")
             termios.tcdrain(fd)
             time.sleep(len(line) / args.cps + args.line_overhead)
