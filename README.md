@@ -126,6 +126,8 @@ Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageW
 
 All three printers are announced on the local network with Avahi, so iPhones and Android phones on the same network can look for them in their normal print menu. Discovery usually doesn't cross VLANs or guest Wi-Fi. On Android, you may need to turn on the Default Print Service under your printing settings.
 
+<img src="docs/phone-print-menu.png" alt="iPhone printer menu listing all three ImageWriter printers" width="300">
+
 Raster jobs (URF or PWG) from a phone are converted to PDF before they reach the backend. They contain only images, so `ImageWriter-Text` refuses them and suggests `ImageWriter-AI`. The same goes for photos. `ImageWriter-Graphics` prints them directly.
 
 **Once announced, `ImageWriter-AI` appears in the print menu of everyone on your network, and their jobs are billed to your API key.** To stop announcing a printer while still using it from this Pi, run `sudo lpadmin -p ImageWriter-AI -o printer-is-shared=false`.
