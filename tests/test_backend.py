@@ -4,7 +4,7 @@
 Run on the print server: /opt/imagewriter/venv/bin/python tests/test_backend.py
 ImageWriter-AI is pointed at a local stand-in for the Claude API.
 """
-import http.server, io, json, os, subprocess, sys, tempfile, threading, unittest
+import base64, http.server, io, json, os, subprocess, sys, tempfile, threading, unittest
 
 from PIL import Image
 
@@ -133,6 +133,13 @@ class AiQueue(Base):
         self.assertIn("server-side-fallback-2026-07-01", headers["anthropic-beta"])
         self.assertTrue(body["stream"])
         self.assertEqual(body["messages"][0]["content"][0]["type"], "document")
+
+    def test_postscript_status_messages_stay_out_of_the_pdf(self):
+        job = b"%!PS\n(driver status) print flush\n/Courier findfont 12 scalefont setfont 72 700 moveto (Hi) show showpage\n"
+        r = self.render("ai", job)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = FakeClaude.requests[0][1]["messages"][0]["content"][0]["source"]["data"]
+        self.assertTrue(base64.b64decode(data).startswith(b"%PDF-"))
 
     def test_large_image_is_shrunk_to_jpeg(self):
         buf = io.BytesIO()

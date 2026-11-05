@@ -149,7 +149,11 @@ def run(cmd, data):
 def to_pdf(data, kind):
     if kind == "pdf":
         return data
-    return run(["gs", "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite", "-sOutputFile=-", "-"], data)
+    # A job's status messages go to stdout too, so keep them out of the PDF
+    pdf = run(["gs", "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sstdout=%stderr", "-sDEVICE=pdfwrite", "-sOutputFile=-", "-"], data)
+    if not pdf.startswith(b"%PDF-"):
+        raise JobError("Could not convert this PostScript job to PDF.")
+    return pdf
 
 
 def pdf_text(pdf):
