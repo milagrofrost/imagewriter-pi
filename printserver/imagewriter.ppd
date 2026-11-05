@@ -1,0 +1,45 @@
+*PPD-Adobe: "4.3"
+*% Describes the ImageWriter to phones and other network clients. Nothing here
+*% renders the job: each format goes to the imagewriter backend unchanged.
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "IMAGEWRT.PPD"
+*Manufacturer: "Apple"
+*Product: "(ImageWriter)"
+*ModelName: "Apple ImageWriter"
+*ShortNickName: "Apple ImageWriter"
+*NickName: "Apple ImageWriter"
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*cupsVersion: 2.4
+*cupsManualCopies: False
+*cupsFilter: "application/pdf 0 -"
+*cupsFilter: "application/vnd.cups-pdf 0 -"
+*cupsFilter: "application/postscript 0 -"
+*cupsFilter: "application/vnd.cups-postscript 0 -"
+*cupsFilter: "image/jpeg 0 -"
+*cupsFilter: "image/png 0 -"
+*cupsFilter: "image/gif 0 -"
+*cupsFilter: "image/tiff 0 -"
+*cupsFilter: "text/plain 0 -"
+*cupsFilter: "text/html 0 -"
+*cupsFilter: "application/vnd.cups-raw 0 -"
+*cupsFilter: "application/octet-stream 0 -"
+*OpenUI *PageSize/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: Letter
+*PageSize Letter/US Letter: "<</PageSize[612 792]>>setpagedevice"
+*CloseUI: *PageSize
+*OpenUI *PageRegion/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: Letter
+*PageRegion Letter/US Letter: "<</PageSize[612 792]>>setpagedevice"
+*CloseUI: *PageRegion
+*DefaultImageableArea: Letter
+*ImageableArea Letter/US Letter: "18 36 594 756"
+*DefaultPaperDimension: Letter
+*PaperDimension Letter/US Letter: "612 792"

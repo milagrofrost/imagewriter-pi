@@ -114,7 +114,15 @@ lp -d ImageWriter-AI article.pdf
 /usr/lib/cups/backend/imagewriter --render ai article.pdf
 ```
 
-Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageWriter-Text` and `http://PI-ADDRESS:631/printers/ImageWriter-AI`. These are raw queues, so the client must send PDF, PostScript, an image or plain text. Other formats are rejected rather than printed as junk.
+Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageWriter-Text` and `http://PI-ADDRESS:631/printers/ImageWriter-AI`. The client must send PDF, PostScript, an image or plain text. Other formats are rejected rather than printed as junk.
+
+### Phones
+
+Both printers are announced on the local network with Avahi, so iPhones and Android phones on the same network can look for them in their normal print menu. Discovery usually doesn't cross VLANs or guest Wi-Fi. On Android, you may need to turn on the Default Print Service under your printing settings.
+
+Raster jobs (URF or PWG) from a phone are converted to PDF before they reach the backend. They contain only images, so `ImageWriter-Text` refuses them and suggests `ImageWriter-AI`. The same goes for photos.
+
+**Once announced, `ImageWriter-AI` appears in the print menu of everyone on your network, and their jobs are billed to your API key.** To stop announcing a printer while still using it from this Pi, run `sudo lpadmin -p ImageWriter-AI -o printer-is-shared=false`.
 
 **Limits:** each job stops at `IMAGEWRITER_MAX_PAGES` (default 4), and `ImageWriter-AI` rejects PDFs over `IMAGEWRITER_MAX_INPUT_PAGES` (default 50). A failed job is dropped without retrying, and the reason appears in the CUPS job log. Change these in the same settings file.
 
