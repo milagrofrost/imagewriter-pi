@@ -11,7 +11,7 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # No recommends: this keeps out cups-browsed, which this setup does not need
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    cups cups-client poppler-utils ghostscript acl python3-venv
+    cups cups-client cups-filters avahi-daemon poppler-utils ghostscript acl python3-venv
 
 install -d -m 755 /opt/imagewriter
 [ -x /opt/imagewriter/venv/bin/python ] || python3 -m venv /opt/imagewriter/venv
@@ -35,11 +35,13 @@ for tty in /dev/ttyUSB*; do
 done
 
 systemctl enable --now cups >/dev/null
-# Share on the local network. Remote administration stays off.
+systemctl enable --now avahi-daemon >/dev/null
+# Share on the local network and announce to phones. Remote administration stays off.
 cupsctl --share-printers --no-remote-admin --no-remote-any PreserveJobFiles=No
 
 add_queue() {
-    lpadmin -p "$1" -v "$2" -m raw -D "$3" -L "$(hostname)" 2>/dev/null
+    # The PPD gives phones a paper size and AirPrint details; jobs still reach the backend unrendered
+    lpadmin -p "$1" -v "$2" -P "$here/imagewriter.ppd" -D "$3" -L "$(hostname)" 2>/dev/null
     lpadmin -p "$1" -E -o printer-is-shared=true -o printer-error-policy=abort-job
 }
 add_queue ImageWriter-Text imagewriter:/text "ImageWriter - prints text as-is"
