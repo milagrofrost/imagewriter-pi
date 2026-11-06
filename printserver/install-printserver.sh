@@ -3,6 +3,7 @@
 #   ImageWriter-Text  prints what it is given
 #   ImageWriter-AI    has Claude rewrite the job as an ASCII printout
 #   ImageWriter-Graphics  prints images and PDFs as real dots
+#   ImageWriter-Banner    has Claude design banners, printed as one long strip
 # Run with sudo from a copy of this repository. Safe to run again.
 set -eu
 
@@ -12,7 +13,8 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # No recommends: this keeps out cups-browsed, which this setup does not need
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    cups cups-client cups-filters avahi-daemon poppler-utils ghostscript acl python3-venv
+    cups cups-client cups-filters avahi-daemon poppler-utils ghostscript acl python3-venv \
+    librsvg2-bin fontconfig
 
 install -d -m 755 /opt/imagewriter
 [ -x /opt/imagewriter/venv/bin/python ] || python3 -m venv /opt/imagewriter/venv
@@ -22,6 +24,9 @@ install -m 755 "$here/../bin/iwprint" /opt/imagewriter/iwprint
 install -o root -g root -m 755 "$here/imagewriter-backend" /usr/lib/cups/backend/imagewriter
 
 install -d -m 755 /etc/imagewriter
+# Banner proof sheets, so a later job can print a design from one
+install -d -m 755 /var/lib/imagewriter
+install -d -o lp -g lp -m 755 /var/lib/imagewriter/banners
 if [ ! -e /etc/imagewriter/imagewriter.env ]; then
     install -o root -g lp -m 640 "$here/imagewriter.env.example" /etc/imagewriter/imagewriter.env
 fi
@@ -48,7 +53,8 @@ add_queue() {
 add_queue ImageWriter-Text imagewriter:/text "ImageWriter - prints text as-is"
 add_queue ImageWriter-AI imagewriter:/ai "ImageWriter - Claude translates the job to ASCII"
 add_queue ImageWriter-Graphics imagewriter:/graphics "ImageWriter - prints images as dots"
+add_queue ImageWriter-Banner imagewriter:/banner "ImageWriter - Claude designs banners"
 lpstat -p
 
 grep -q '^ANTHROPIC_API_KEY=.' /etc/imagewriter/imagewriter.env ||
-    echo "NOTE: ImageWriter-AI needs an API key in /etc/imagewriter/imagewriter.env"
+    echo "NOTE: ImageWriter-AI and ImageWriter-Banner need an API key in /etc/imagewriter/imagewriter.env"
