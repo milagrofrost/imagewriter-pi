@@ -1,10 +1,31 @@
 # imagewriter-pi
 
-Print plain text, ASCII art and dot graphics on an Apple ImageWriter I from a Raspberry Pi, over a USB-to-serial adapter. The core tools need no driver or CUPS, just a small Python script.
+The Apple ImageWriter is a dot-matrix printer from 1984. This project puts one back to work. You plug it into a Raspberry Pi, and the Pi turns it into a network printer. Your phone or computer can then print to it like any other printer, including from the iPhone print menu.
 
 ```
-Raspberry Pi -> USB-serial adapter -> serial cable -> ImageWriter
+Phone or computer -> Wi-Fi -> Raspberry Pi -> USB-serial adapter -> serial cable -> ImageWriter
 ```
+
+## Four ways to print
+
+The Pi offers the one ImageWriter as four separate printers. Pick one in your print menu depending on what you want on paper:
+
+| Printer | What comes out | Good for | Needs Claude? |
+|---|---|---|---|
+| **ImageWriter-Text** | Your text, exactly as written, in the printer's own typeface. PDFs have their text pulled out. Images are refused. | Notes, lists, logs, code | No |
+| **ImageWriter-AI** | Claude rewrites whatever you send as a tidy plain-text printout. Web pages lose their clutter, tables are rebuilt, and pictures become ASCII art. | Web pages, emails, documents, photos as ASCII art | Yes |
+| **ImageWriter-Graphics** | Pictures and PDF pages printed as real dots, the way the printer did graphics in the '80s, with shading turned into dot patterns. | Photos, drawings, screenshots, PDFs that should look like the original | No |
+| **ImageWriter-Banner** | Claude designs a banner from your description. You get a proof sheet with three small designs, then pick one and it prints sideways as one long strip of fanfold paper. | Party banners, signs, anything several feet long | Yes |
+
+The two Claude printers send your job to the Anthropic API and need your own API key, which is billed per job. ImageWriter-AI costs a few cents a page, and a banner proof sheet about 25 cents. The other two run entirely on the Pi.
+
+**Preview before printing.** Any of the four can draw a picture of what would come out, with the page count and printing time, without using paper. See [Preview without using paper](#preview-without-using-paper).
+
+**Where to start:**
+1. Get the Pi talking to the printer with the plain command-line tools ([You need](#you-need) through [Everyday use](#everyday-use)).
+2. Then set up the four printers with the [Print server](#print-server) installer, and print from your phone ([Phones](#phones)).
+
+You can stop after step 1 if you only want to print from the Pi itself. The core tool, `iwprint`, needs no driver or CUPS, just Python.
 
 **Tested on one setup:** a 64-bit Raspberry Pi running Debian with kernel 6.18, a Prolific PL2303 adapter, and an ImageWriter I at 9600 baud. Other adapters and cables may behave differently, especially at the flow-control step below.
 
