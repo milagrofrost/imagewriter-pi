@@ -111,14 +111,31 @@ Then add your API key to `/etc/imagewriter/imagewriter.env`, which is readable o
 sudo nano /etc/imagewriter/imagewriter.env
 ```
 
-Print from the Pi or preview without using paper:
+Print from the Pi:
 
 ```bash
 lp -d ImageWriter-Text notes.txt
 lp -d ImageWriter-AI article.pdf
-/usr/lib/cups/backend/imagewriter --render ai article.pdf
-/usr/lib/cups/backend/imagewriter --render graphics photo.jpg > preview.pbm
 ```
+
+#### Preview without using paper
+
+`--preview` draws a job as it would come off the printer: dot-matrix text or dithered dots on tractor-feed paper, with the page count and an estimate of the printing time. Use `text`, `ai` or `graphics` for one printer, or `all` to see the three side by side. A job a printer would refuse shows blank paper and the reason.
+
+```bash
+/usr/lib/cups/backend/imagewriter --preview graphics photo.jpg photo-preview.png
+/usr/lib/cups/backend/imagewriter --preview text notes.txt notes-preview.png
+sudo /usr/lib/cups/backend/imagewriter --preview all cat.png cat-preview.png
+```
+
+Previews that include `ai` or `all` need `sudo` to read the API key, and they call Claude and bill your key just like printing does. Claude draws the job afresh each time, so the printed version will differ. To print exactly what you previewed, save it as text and send that to `ImageWriter-Text`:
+
+```bash
+sudo /usr/lib/cups/backend/imagewriter --render ai article.pdf > article.txt
+lp -d ImageWriter-Text article.txt
+```
+
+`--render graphics FILE > preview.pbm` writes the raw dots that `ImageWriter-Graphics` would send.
 
 Other computers can add the printers from `http://PI-ADDRESS:631/printers/ImageWriter-Text`, `http://PI-ADDRESS:631/printers/ImageWriter-AI` and `http://PI-ADDRESS:631/printers/ImageWriter-Graphics`. The client must send PDF, PostScript, an image or plain text. Other formats are rejected rather than printed as junk.
 

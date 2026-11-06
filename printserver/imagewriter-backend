@@ -6,7 +6,8 @@ rewrite the job (PDF, image, web page or text) as a readable ASCII printout.
 Both end by handing plain text to iwprint, which paces it to the printer.
 imagewriter:/graphics turns images and PDFs into dots and hands iwprint bitmaps.
 
-Preview without paper:  imagewriter --render text|ai FILE
+Preview without paper:  imagewriter --preview text|ai|graphics|all FILE OUT.png
+                        imagewriter --render text|ai FILE
                         imagewriter --render graphics FILE > preview.pbm
 """
 import base64, io, math, os, re, subprocess, sys, tempfile, textwrap, unicodedata
@@ -21,6 +22,7 @@ LINE_ART_MAX_MIDTONES = 0.15  # share of grey pixels above which a job is dither
 MAX_JOB_BYTES = 30 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 BACKEND_CANCEL_JOB = 5     # CUPS_BACKEND_CANCEL: drop this job, keep the queue running
+QUEUES = {"text": "ImageWriter-Text", "ai": "ImageWriter-AI", "graphics": "ImageWriter-Graphics"}
 
 ASCII_FOR = {
     "‘": "'", "’": "'", "‚": "'", "“": '"', "”": '"', "„": '"',
@@ -313,8 +315,8 @@ def to_dots(im):
     return im.convert("1")
 
 
-def render_graphics(data, kind):
-    """Return (binary PBM images, page count); only the last page stops early."""
+def graphics_sheets(data, kind):
+    """The job as 1-bit pages, black = dot; only the last page stops early."""
     from PIL import Image, ImageChops
 
     pages = [to_dots(im) for im in job_pictures(data, kind)[:max_pages()]]
@@ -324,13 +326,212 @@ def render_graphics(data, kind):
     while not boxes[-1]:
         pages.pop()
         boxes.pop()
-    out = io.BytesIO()
+    sheets = []
     for i, page in enumerate(pages):
         height = DOT_ROWS if i < len(pages) - 1 else (boxes[i][3] + 7) // 8 * 8
         sheet = Image.new("1", (page.width, height), 1)
         sheet.paste(page, (0, 0))
+        sheets.append(sheet)
+    return sheets
+
+
+def render_graphics(data, kind):
+    """Return (binary PBM images, page count)."""
+    sheets = graphics_sheets(data, kind)
+    out = io.BytesIO()
+    for sheet in sheets:
         sheet.save(out, "PPM")
-    return out.getvalue(), len(pages)
+    return out.getvalue(), len(sheets)
+
+
+# --- Preview: draw the job as it would come out of the printer ---------------
+
+PREVIEW_DPI = 216            # a whole number of pixels (3) per 1/72-inch row of dots
+TEXT_DOT_WIDTH = 1 / 90      # characters are 9 dot positions across at 10 per inch
+GRAPHICS_DOT_WIDTH = 1 / 72
+SERIAL_BYTES_PER_SECOND = 960
+PAPER_COLOR = (251, 249, 242)
+INK_COLOR = (34, 33, 40)
+DESK_COLOR = (54, 57, 63)
+LABEL_COLOR = (236, 236, 232)
+NOTE_COLOR = (178, 182, 190)
+FONT_DIRS = ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu", "/usr/share/fonts/TTF",
+             "/Library/Fonts", "/System/Library/Fonts/Supplemental", "C:/Windows/Fonts")
+_fonts, _glyphs, _lattices = {}, {}, {}
+
+
+def font(names, size):
+    from PIL import ImageFont
+
+    key = (names, size)
+    if key not in _fonts:
+        path = next((os.path.join(d, n) for d in FONT_DIRS for n in names if os.path.exists(os.path.join(d, n))), None)
+        _fonts[key] = ImageFont.truetype(path, size) if path else ImageFont.load_default(size)
+    return _fonts[key]
+
+
+def label_font(size, bold=False):
+    names = ("DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf") if bold else ("DejaVuSans.ttf", "Arial.ttf", "arial.ttf")
+    return font(names, size)
+
+
+def glyph(ch):
+    """A character as dots: 9 positions across, 12 rows of 1/72 inch down, like the draft font."""
+    from PIL import Image, ImageDraw
+
+    if ch not in _glyphs:
+        k = 8  # draw large, then keep each dot position that is mostly ink
+        im = Image.new("L", (9 * k, 12 * k), 0)
+        mono = font(("DejaVuSansMono.ttf", "Menlo.ttc", "consola.ttf", "cour.ttf"), round(9.6 * k))
+        ImageDraw.Draw(im).text((4.5 * k, 8 * k), ch, font=mono, fill=255, anchor="ms")
+        _glyphs[ch] = im.reduce(k).point(lambda v: 255 if v > 80 else 0)
+    return _glyphs[ch]
+
+
+def text_dot_pages(text):
+    from PIL import Image
+
+    lines = text.rstrip("\n").split("\n")
+    pages = []
+    for start in range(0, len(lines), LINES_PER_PAGE):
+        page = Image.new("L", (COLUMNS * 9, DOT_ROWS), 0)
+        for row, line in enumerate(lines[start:start + LINES_PER_PAGE]):
+            for col, ch in enumerate(line[:COLUMNS]):
+                if ch != " ":
+                    page.paste(glyph(ch), (col * 9, row * 12))
+        pages.append(page)
+    return pages
+
+
+def text_seconds(text):
+    # Mirrors iwprint's pacing: send the line, then wait for the head to print it
+    return sum((len(l) + 2) / SERIAL_BYTES_PER_SECOND + len(l) / 100 + 0.35 for l in text.rstrip("\n").split("\n"))
+
+
+def graphics_seconds(sheets):
+    from PIL import ImageChops
+
+    total = 0.0
+    for sheet in sheets:
+        ink = ImageChops.invert(sheet.convert("L"))
+        for top in range(0, sheet.height, 8):
+            box = ink.crop((0, top, sheet.width, top + 8)).getbbox()
+            width = box[2] if box else 0
+            total += (width + 8) / SERIAL_BYTES_PER_SECOND + width / 400 + 0.6 if width else 0.25
+    return total
+
+
+def lattice(columns, rows, dot_width):
+    """Where a pin strike can land: one soft round dot per position, 1/72 inch between rows."""
+    from PIL import Image, ImageDraw
+
+    key = (columns, rows, dot_width)
+    if key not in _lattices:
+        row = PREVIEW_DPI // 72
+        width = round(columns * dot_width * PREVIEW_DPI)
+        k = 4
+        strip = Image.new("L", (width * k, row * k), 0)
+        draw = ImageDraw.Draw(strip)
+        r = row * k * 0.56  # a pin is a little wider than the gap between rows
+        for i in range(columns):
+            cx, cy = (i + 0.5) * dot_width * PREVIEW_DPI * k, row * k / 2
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+        strip = strip.resize((width, row), Image.LANCZOS)
+        grid = Image.new("L", (width, rows * row), 0)
+        for y in range(rows):
+            grid.paste(strip, (0, y * row))
+        _lattices[key] = grid
+    return _lattices[key]
+
+
+def ink(dots, dot_width):
+    """Turn a page of dot positions (255 = strike) into an ink mask at PREVIEW_DPI."""
+    from PIL import Image, ImageChops, ImageFilter
+
+    grid = lattice(dots.width, dots.height, dot_width)
+    strikes = dots.resize(grid.size, Image.NEAREST)
+    return ImageChops.multiply(strikes, grid).filter(ImageFilter.GaussianBlur(0.4))
+
+
+def paper(pages):
+    """Continuous tractor-feed paper: 8.5-inch sheets with tear-off strips and holes."""
+    from PIL import Image, ImageDraw
+
+    d = PREVIEW_DPI
+    im = Image.new("RGB", (round(9.5 * d), 11 * d * pages), PAPER_COLOR)
+    draw = ImageDraw.Draw(im)
+    hole = d * 5 / 64
+    for y in range(pages * 22):
+        for x in (0.25 * d, 9.25 * d):
+            cy = (y + 0.5) * d / 2
+            draw.ellipse((x - hole, cy - hole, x + hole, cy + hole), fill=DESK_COLOR)
+    perforation = (214, 210, 200)
+    for y in range(0, im.height, d // 12):
+        for x in (0.5 * d, 9.0 * d):
+            draw.line((x, y, x, y + d // 24), fill=perforation)
+    for page in range(1, pages):
+        for x in range(0, im.width, d // 12):
+            draw.line((x, page * 11 * d, x + d // 24, page * 11 * d), fill=perforation)
+    return im
+
+
+def minutes(seconds):
+    return "under a minute" if seconds < 60 else "about %d min" % round(seconds / 60)
+
+
+def preview_column(mode, data, title):
+    """(heading, note, paper image) for one queue; a refused job shows blank paper and the reason."""
+    from PIL import Image, ImageDraw
+
+    try:
+        check_size(data)
+        kind = detect(data)
+        if mode == "graphics":
+            sheets = graphics_sheets(data, kind)
+            masks = []
+            for sheet in sheets:
+                dots = Image.new("L", (DOT_COLUMNS, DOT_ROWS), 0)
+                dots.paste(Image.eval(sheet.convert("L"), lambda v: 255 - v), (0, 0))
+                masks.append(ink(dots, GRAPHICS_DOT_WIDTH))
+            seconds = graphics_seconds(sheets)
+        else:
+            text = fit_to_paper(render_ai(data, kind, title) if mode == "ai" else render_text(data, kind))
+            masks = [ink(page, TEXT_DOT_WIDTH) for page in text_dot_pages(text)]
+            seconds = text_seconds(text)
+    except JobError as e:
+        sheet = paper(1)
+        draw = ImageDraw.Draw(sheet)
+        lines = textwrap.wrap("Would not print: %s" % e, 34, break_on_hyphens=False) + ["", "No paper is used."]
+        draw.multiline_text((sheet.width / 2, 3 * PREVIEW_DPI), "\n".join(lines), font=label_font(PREVIEW_DPI // 6),
+                            fill=(120, 116, 108), anchor="ma", align="center", spacing=PREVIEW_DPI // 12)
+        return QUEUES[mode], "refuses this job", sheet
+    sheet = paper(len(masks))
+    for i, mask in enumerate(masks):
+        sheet.paste(INK_COLOR, (round(0.75 * PREVIEW_DPI), i * 11 * PREVIEW_DPI), mask)
+    note = "%d page%s, %s" % (len(masks), "" if len(masks) == 1 else "s", minutes(seconds))
+    if mode == "ai":
+        note += ". Claude draws it afresh each time"
+    return QUEUES[mode], note, sheet
+
+
+def preview(mode, data, title):
+    """One image with the job as each requested queue would print it, side by side."""
+    from PIL import Image, ImageDraw
+
+    columns = [preview_column(m, data, title) for m in (QUEUES if mode == "all" else [mode])]
+    d = PREVIEW_DPI
+    margin, head = d // 2, d
+    width = margin + sum(c[2].width + margin for c in columns)
+    height = head + max(c[2].height for c in columns) + margin
+    out = Image.new("RGB", (width, height), DESK_COLOR)
+    draw = ImageDraw.Draw(out)
+    x = margin
+    for heading, note, sheet in columns:
+        draw.text((x, margin * 0.6), heading, font=label_font(d // 5, bold=True), fill=LABEL_COLOR)
+        draw.text((x, margin * 0.6 + d * 0.27), note, font=label_font(d // 8), fill=NOTE_COLOR)
+        out.paste(sheet, (x, head))
+        x += sheet.width + margin
+    return out
 
 
 def check_size(data):
@@ -385,7 +586,11 @@ def main():
         return
     load_env()
     try:
-        if sys.argv[1] == "--render" and len(sys.argv) == 4:
+        if sys.argv[1] == "--preview" and len(sys.argv) == 5 and sys.argv[2] in ("all", *QUEUES):
+            with open(sys.argv[3], "rb") as f:
+                data = f.read()
+            preview(sys.argv[2], data, os.path.basename(sys.argv[3])).save(sys.argv[4], "PNG")
+        elif sys.argv[1] == "--render" and len(sys.argv) == 4:
             with open(sys.argv[3], "rb") as f:
                 data = f.read()
             if sys.argv[2] == "graphics":
@@ -396,7 +601,9 @@ def main():
         elif len(sys.argv) in (6, 7):
             backend_main()
         else:
-            sys.exit("usage: imagewriter job-id user title copies options [file]\n       imagewriter --render text|ai|graphics FILE")
+            sys.exit("usage: imagewriter job-id user title copies options [file]\n"
+                     "       imagewriter --render text|ai|graphics FILE\n"
+                     "       imagewriter --preview text|ai|graphics|all FILE OUT.png")
     except JobError as e:
         print("ERROR: %s" % e, file=sys.stderr)
         sys.exit(BACKEND_CANCEL_JOB)

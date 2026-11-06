@@ -58,7 +58,8 @@ class Base(unittest.TestCase):
         FakeClaude.reply, FakeClaude.stop_reason = "HELLO\n", "end_turn"
         FakeClaude.requests = []
 
-    def render(self, mode, data, key="test-key", **env):
+    def backend(self, args, data, key="test-key", **env):
+        """Run the backend with the job saved to a file, which replaces "JOB" in args."""
         with tempfile.NamedTemporaryFile() as f:
             f.write(data)
             f.flush()
@@ -67,7 +68,17 @@ class Base(unittest.TestCase):
             e.pop("ANTHROPIC_AUTH_TOKEN", None)
             if key:
                 e["ANTHROPIC_API_KEY"] = key
-            return subprocess.run([sys.executable, BACKEND, "--render", mode, f.name], capture_output=True, env=e)
+            args = [f.name if a == "JOB" else a for a in args]
+            return subprocess.run([sys.executable, BACKEND, *args], capture_output=True, env=e)
+
+    def render(self, mode, data, **kwargs):
+        return self.backend(["--render", mode, "JOB"], data, **kwargs)
+
+
+def png_bytes(im):
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
 
 
 def make_pdf(text):
@@ -276,6 +287,60 @@ class GraphicsQueue(Base):
     def test_no_request_reaches_claude(self):
         self.pbm(self.png(Image.new("L", (50, 50), 0)), key=None)
         self.assertEqual(FakeClaude.requests, [])
+
+
+class Preview(Base):
+    # At 216 pixels per inch: a 0.5-inch border, a 1-inch heading, then 9.5 x 11-inch sheets
+    DPI = 216
+    SHEET_WIDTH, SHEET_HEIGHT = 2052, 2376
+    TOP = DPI
+    PRINT_LEFT = DPI // 2 + DPI * 3 // 4  # the printer's first column, 0.75 inch into the sheet
+
+    def preview(self, mode, data, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "preview.png")
+            r = self.backend(["--preview", mode, "JOB", out], data, **kwargs)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with Image.open(out) as im:
+                return im.convert("L")
+
+    def darkest(self, im, left, top, width, height):
+        return im.crop((left, top, left + width, top + height)).getextrema()[0]
+
+    def test_text_is_drawn_in_dots_where_the_printer_puts_it(self):
+        im = self.preview("text", b"XXXX\n")
+        self.assertEqual(im.size, (self.DPI + self.SHEET_WIDTH, self.TOP + self.SHEET_HEIGHT + self.DPI // 2))
+        self.assertLess(self.darkest(im, self.PRINT_LEFT, self.TOP, self.DPI * 4 // 10, self.DPI // 6), 80)
+        # Nothing after the fourth character: ten characters per inch
+        self.assertGreater(self.darkest(im, self.PRINT_LEFT + self.DPI // 2, self.TOP, self.DPI, self.DPI // 6), 200)
+
+    def test_each_66_lines_starts_a_new_sheet(self):
+        im = self.preview("text", b"line\n" * 70)
+        self.assertEqual(im.height, self.TOP + 2 * self.SHEET_HEIGHT + self.DPI // 2)
+
+    def test_image_is_drawn_as_dots(self):
+        im = self.preview("graphics", png_bytes(Image.new("L", (100, 100), 0)))
+        self.assertLess(self.darkest(im, self.PRINT_LEFT, self.TOP, self.DPI, self.DPI), 80)
+
+    def test_refused_job_shows_blank_paper_without_failing(self):
+        im = self.preview("graphics", b"hello\n")
+        # The reason is printed in grey on the sheet, never as dark ink
+        self.assertGreater(self.darkest(im, self.PRINT_LEFT, self.TOP, 8 * self.DPI, 11 * self.DPI), 100)
+
+    def test_all_shows_the_three_queues_side_by_side(self):
+        im = self.preview("all", b"hello\n")
+        self.assertEqual(im.width, self.DPI // 2 + 3 * (self.SHEET_WIDTH + self.DPI // 2))
+        self.assertEqual(len(FakeClaude.requests), 1)
+
+    def test_text_and_graphics_previews_never_reach_claude(self):
+        self.preview("text", b"hello\n", key=None)
+        self.preview("graphics", png_bytes(Image.new("L", (50, 50), 0)), key=None)
+        self.assertEqual(FakeClaude.requests, [])
+
+    def test_unknown_queue_is_a_usage_error(self):
+        r = self.backend(["--preview", "colour", "JOB", "/dev/null"], b"hello\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(b"usage", r.stderr)
 
 
 if __name__ == "__main__":
