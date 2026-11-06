@@ -12,12 +12,19 @@ BACKEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prints
 
 
 def sse(reply, stop_reason):
+    """A streamed reply: text, or {"tool_use": input} for a measure_text call."""
+    if isinstance(reply, dict):
+        block = {"type": "tool_use", "id": "toolu_test", "name": "measure_text", "input": {}}
+        delta = {"type": "input_json_delta", "partial_json": json.dumps(reply["tool_use"])}
+        stop_reason = "tool_use"
+    else:
+        block, delta = {"type": "text", "text": ""}, {"type": "text_delta", "text": reply}
     events = [
         ("message_start", {"type": "message_start", "message": {
             "id": "msg_test", "type": "message", "role": "assistant", "model": "test", "content": [],
             "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 7, "output_tokens": 1}}}),
-        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
-        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": reply}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": block}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
         ("content_block_stop", {"type": "content_block_stop", "index": 0}),
         ("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 9}}),
         ("message_stop", {"type": "message_stop"}),
@@ -27,13 +34,15 @@ def sse(reply, stop_reason):
 
 class FakeClaude(http.server.BaseHTTPRequestHandler):
     reply = "HELLO\n"
+    script = []  # replies for successive requests; once used up, every request gets reply
     stop_reason = "end_turn"
     requests = []
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeClaude.requests.append((dict(self.headers), body))
-        payload = sse(FakeClaude.reply, FakeClaude.stop_reason)
+        reply = FakeClaude.script.pop(0) if FakeClaude.script else FakeClaude.reply
+        payload = sse(reply, FakeClaude.stop_reason)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
@@ -56,7 +65,7 @@ class Base(unittest.TestCase):
 
     def setUp(self):
         FakeClaude.reply, FakeClaude.stop_reason = "HELLO\n", "end_turn"
-        FakeClaude.requests = []
+        FakeClaude.requests, FakeClaude.script = [], []
 
     def backend(self, args, data, key="test-key", **env):
         """Run the backend with the job saved to a file, which replaces "JOB" in args."""
@@ -341,6 +350,160 @@ class Preview(Base):
         r = self.backend(["--preview", "colour", "JOB", "/dev/null"], b"hello\n")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(b"usage", r.stderr)
+
+
+def design_svg(length=1440, extra=""):
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d 576">'
+            '<rect x="20" y="20" width="%d" height="536" fill="none" stroke="black" stroke-width="12"/>'
+            '<text x="%d" y="380" font-family="Nimbus Sans" font-size="300" text-anchor="middle">HI</text>%s</svg>'
+            % (length, length - 40, length // 2, extra))
+
+
+def proposal(*svgs):
+    return json.dumps({"action": "propose", "proof": "", "option": "",
+                       "designs": [{"title": "Design %d" % i, "svg": svg} for i, svg in enumerate(svgs)]})
+
+
+class BannerQueue(Base):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def banner(self, data, **env):
+        return self.render("banner", data, IMAGEWRITER_STATE_DIR=self.state, **env)
+
+    def proofs(self):
+        folder = os.path.join(self.state, "banners")
+        proofs = []
+        for name in sorted(n for n in os.listdir(folder) if n.endswith(".json")):
+            with open(os.path.join(folder, name)) as f:
+                proofs.append(json.load(f))
+        return proofs
+
+    def propose(self, *svgs):
+        FakeClaude.reply = proposal(*svgs)
+        r = self.banner(b"HAPPY HALLOWEEN with bats\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def test_request_prints_a_proof_sheet_and_saves_the_designs(self):
+        r = self.propose(design_svg(1440), design_svg(2160), design_svg(2880))
+        sheet = Image.open(io.BytesIO(r.stdout))
+        self.assertEqual(sheet.width, 576)
+        self.assertLessEqual(sheet.height, 792)
+        self.assertEqual(r.stdout.count(b"P4\n"), 1)
+        [proof] = self.proofs()
+        self.assertEqual([d["letter"] for d in proof["designs"]], ["A", "B", "C"])
+        self.assertEqual([d["length"] for d in proof["designs"]], [1440, 2160, 2880])
+        self.assertIn(proof["code"].encode(), r.stderr)
+        body = FakeClaude.requests[0][1]
+        self.assertEqual(body["output_config"]["format"]["type"], "json_schema")
+        self.assertIn("viewBox", body["system"][0]["text"] if isinstance(body["system"], list) else body["system"])
+
+    def test_typed_choice_prints_the_whole_banner_without_claude(self):
+        self.propose(design_svg(1440), design_svg(2160))
+        code = self.proofs()[0]["code"]
+        FakeClaude.requests = []
+        r = self.banner(("print %s b\n" % code.lower()).encode(), key=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        strip = Image.open(io.BytesIO(r.stdout))
+        self.assertEqual(strip.size, (576, 2160))  # sideways: the banner's length runs down the paper
+        self.assertEqual(FakeClaude.requests, [])
+
+    def test_choice_in_other_words_goes_through_claude(self):
+        self.propose(design_svg(1440), design_svg(2160))
+        code = self.proofs()[0]["code"]
+        FakeClaude.reply = json.dumps({"action": "print", "proof": code, "option": "A", "designs": []})
+        r = self.banner(b"the first one please\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Image.open(io.BytesIO(r.stdout)).size, (576, 1440))
+        context = json.dumps(FakeClaude.requests[-1][1]["messages"])
+        self.assertIn(code, context)
+        self.assertIn("viewBox", context)  # the newest proof's designs, for changes to build on
+
+    def test_unknown_proof_is_refused(self):
+        r = self.banner(b"print ZZZ A\n")
+        self.assertEqual(r.returncode, 5)
+        self.assertEqual(r.stdout, b"")
+        self.assertIn(b"no banner proof sheet ZZZ", r.stderr)
+
+    def test_unsafe_or_wrong_size_designs_are_dropped(self):
+        self.propose(design_svg(1440, '<image href="file:///etc/passwd" width="10" height="10"/>'),
+                     design_svg(1440).replace("576", "500", 1),
+                     design_svg(1440))
+        [proof] = self.proofs()
+        self.assertEqual([(d["letter"], d["title"]) for d in proof["designs"]], [("A", "Design 2")])
+
+    def test_no_usable_design_prints_nothing(self):
+        FakeClaude.reply = proposal(design_svg(1440, "<script>alert(1)</script>"),
+                                    design_svg(1440, '<rect fill="url(http://example.com/x)" width="5" height="5"/>'),
+                                    design_svg(99999))
+        r = self.banner(b"HELLO\n")
+        self.assertEqual(r.returncode, 5)
+        self.assertEqual(r.stdout, b"")
+
+    def test_length_limit_is_a_setting(self):
+        FakeClaude.reply = proposal(design_svg(2160))
+        r = self.banner(b"HELLO\n", IMAGEWRITER_MAX_BANNER_FEET="2")
+        self.assertEqual(r.returncode, 5)
+        self.assertIn(b"2 ft", r.stderr)
+
+    def test_old_proofs_expire(self):
+        self.propose(design_svg(1440))
+        folder = os.path.join(self.state, "banners")
+        path = os.path.join(folder, os.listdir(folder)[0])
+        os.utime(path, (0, 0))
+        code = os.path.basename(path)[:-5]
+        r = self.banner(("print %s A\n" % code).encode())
+        self.assertEqual(r.returncode, 5)
+        self.assertFalse(os.path.exists(path))
+
+    def test_claude_can_measure_lettering_first(self):
+        item = {"text": "HI", "font_family": "Nimbus Sans", "font_size": 100, "font_weight": "normal", "letter_spacing": 0}
+        FakeClaude.script = [{"tool_use": {"items": [item, dict(item, text="HIHIHI")]}}, proposal(design_svg(1440))]
+        r = self.banner(b"HI\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        result = FakeClaude.requests[1][1]["messages"][-1]["content"][0]
+        self.assertEqual(result["type"], "tool_result")
+        short, long = json.loads(result["content"])
+        self.assertTrue(40 < short["width"] < 200, short)
+        self.assertAlmostEqual(long["width"] / short["width"], 3.4, delta=0.4)  # 3 copies and 2 gaps between them
+        self.assertTrue(60 < short["height"] < 90, short)
+
+    def test_lettering_past_the_end_is_sent_back_once(self):
+        spill = design_svg(1440, '<rect x="1300" y="100" width="400" height="50"/>')
+        FakeClaude.script = [proposal(spill, design_svg(2160))]
+        FakeClaude.reply = proposal(spill, design_svg(2160))  # the "fix" changes nothing
+        r = self.banner(b"HI\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(FakeClaude.requests), 2)
+        feedback = FakeClaude.requests[1][1]["messages"][-1]["content"]
+        self.assertIn("Design 1", feedback)
+        self.assertRegex(feedback, r"\b2[56]\d units past the end")  # 1700 drawn on a 1440-long banner
+        [proof] = self.proofs()
+        self.assertEqual([d["length"] for d in proof["designs"]], [2160])
+
+    def test_fixed_design_is_used(self):
+        spill = design_svg(1440, '<rect x="-50" y="100" width="100" height="50"/>')
+        FakeClaude.script = [proposal(spill), proposal(design_svg(1800))]
+        r = self.banner(b"HI\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(b"past the start", r.stderr)
+        [proof] = self.proofs()
+        self.assertEqual(proof["designs"][0]["length"], 1800)
+
+    def test_preview_draws_the_proof_sheet(self):
+        FakeClaude.reply = proposal(design_svg(1440))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "p.png")
+            r = self.backend(["--preview", "banner", "JOB", out], b"HELLO\n", IMAGEWRITER_STATE_DIR=self.state)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with Image.open(out) as im:
+                self.assertGreater(im.width, 2000)
 
 
 if __name__ == "__main__":
